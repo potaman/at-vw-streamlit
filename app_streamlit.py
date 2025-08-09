@@ -11,7 +11,7 @@ from sklearn.cluster import KMeans
 from skimage import color, util, exposure, restoration, measure, morphology, filters
 
 # ===================== Page / Config =====================
-st.set_page_config(page_title="AT/TV/RGF/Guided + VW/RDP (run button, progress, modes, help)", layout="wide")
+st.set_page_config(page_title="Watercolor Value Helper)", layout="wide")
 
 # --- Session state ---
 if "ready" not in st.session_state:
@@ -309,8 +309,8 @@ def render_per_level(base_img, levels, contours_by_level, mode):
     return figs
 
 # ===================== Sidebar (with help + Run) =====================
-st.title("AT / TV / RGF / Guided  +  VW/RDP  (Run button, progress, dark_first/light_first)")
-
+st.title("Watercolor value helper")
+st.markdown("A helper for when your squint isn't there yet!\n")
 with st.sidebar:
     st.header("Quick start")
     st.markdown(
