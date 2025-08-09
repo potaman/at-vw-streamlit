@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-import io, os, zipfile, json
+import io, os, zipfile, json, hashlib
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -11,20 +11,15 @@ from sklearn.cluster import KMeans
 from skimage import color, util, exposure, restoration, measure, morphology, filters
 
 # ===================== Page / Config =====================
-st.set_page_config(page_title="Watercolor Value Helper", layout="wide")
+st.set_page_config(page_title="AT/TV/RGF/Guided + VW/RDP (run button, progress, modes, help)", layout="wide")
 
-# ===================== Shims (compat layer) =====================
-try:
-    cache_data = st.cache_data
-except AttributeError:
-    cache_data = st.cache
+# --- Session state ---
+if "ready" not in st.session_state:
+    st.session_state.ready = False
+if "last_image_key" not in st.session_state:
+    st.session_state.last_image_key = None
 
-def cache_data_deco(**kwargs):
-    try:
-        return cache_data(**kwargs)
-    except TypeError:
-        return cache_data()
-
+# ===================== Small helpers =====================
 def show_image(img, **kwargs):
     try:
         st.image(img, use_container_width=True, **kwargs)
@@ -44,22 +39,6 @@ except AttributeError:
     RESAMPLE_LANCZOS = Image.LANCZOS             # Older Pillow
     RESAMPLE_NEAREST = Image.NEAREST
 
-def caption(txt):
-    try:
-        st.caption(txt)
-    except AttributeError:
-        st.write(txt)
-
-# ===================== Utilities =====================
-def to_gray(img):
-    arr = np.asarray(img)
-    if arr.ndim == 3:
-        arr = color.rgb2gray(arr)
-    return util.img_as_float(arr)
-
-def clahe(img, clip_limit=0.01, nbins=256):
-    return exposure.equalize_adapthist(img, clip_limit=clip_limit, nbins=nbins)
-
 def grayscale_levels_cmap(levels):
     # 0 -> black, max -> white
     if levels <= 1:
@@ -76,7 +55,7 @@ def _level_colors(levels):
         cols = np.vstack([cols for _ in range(reps)])[:levels]
     return cols
 
-# --- RDP (fallback) ---
+# ===================== Geometry simplification =====================
 def rdp(points, epsilon):
     points = np.asarray(points)
     if len(points) < 3:
@@ -100,7 +79,6 @@ def rdp(points, epsilon):
         return np.vstack([left[:-1], right])
     return np.vstack([start, end])
 
-# --- Visvalingam–Whyatt simplification ---
 def _triangle_area(a, b, c):
     return 0.5 * abs(a[1]*(b[0]-c[0]) + b[1]*(c[0]-a[0]) + c[1]*(a[0]-b[0]))
 
@@ -144,7 +122,16 @@ def visvalingam_whyatt(points, area_thresh=None, keep_ratio=None, preserve_ends=
         if not np.allclose(simplified[-1], pts[-1]): simplified = np.vstack([simplified, pts[-1]])
     return simplified
 
-# ===================== Core smoothing options =====================
+# ===================== Core image ops =====================
+def to_gray(img):
+    arr = np.asarray(img)
+    if arr.ndim == 3:
+        arr = color.rgb2gray(arr)
+    return util.img_as_float(arr)
+
+def clahe(img, clip_limit=0.01, nbins=256):
+    return exposure.equalize_adapthist(img, clip_limit=clip_limit, nbins=nbins)
+
 def ambrosio_tortorelli(f, lam=0.25, alpha=0.06, eps=1.2, n_iters=200, tau_u=0.2, tau_v=0.15):
     f = f.astype(np.float64); u = f.copy(); v = np.ones_like(f)
     def grad_x(a):
@@ -160,7 +147,7 @@ def ambrosio_tortorelli(f, lam=0.25, alpha=0.06, eps=1.2, n_iters=200, tau_u=0.2
         ux = grad_x(u); uy = grad_y(u); v2 = v*v; px = v2 * ux; py = v2 * uy
         smooth = div(px, py); du = (u - f) + lam * smooth; u = np.clip(u - tau_u * du, 0, 1)
         ux = grad_x(u); uy = grad_y(u); lap_v = div(grad_x(v), grad_y(v))
-        dv = 2.0*v*(ux*ux + uy*uy) + alpha*( -2.0*eps*lap_v + (v-1.0)/(2.0*eps) )
+        dv = 2.0*v*(ux*ux + uy*uy) + alpha*(-2.0*eps*lap_v + (v-1.0)/(2.0*eps))
         v = np.clip(v - tau_v * dv, 0.0, 1.0)
     return u, v
 
@@ -173,16 +160,13 @@ def rolling_guidance(f, sigma_s=3, sigma_r=0.05, iters=4):
         g = restoration.denoise_bilateral(g, sigma_color=float(sigma_r), sigma_spatial=float(sigma_s))
     return g
 
-# Guided filter: try OpenCV fast path; else NumPy fallback
 def _guided_filter_numpy(I, r=8, eps=1e-4):
     I = I.astype(np.float64)
     H, W = I.shape
     def integ(img):
-        ii = np.pad(img, ((1,0),(1,0)), mode='constant').cumsum(0).cumsum(1)
-        return ii
+        return np.pad(img, ((1,0),(1,0)), mode='constant').cumsum(0).cumsum(1)
     def boxfilter(img, r):
-        ii = integ(img
-        )
+        ii = integ(img)
         y = np.arange(H); x = np.arange(W)
         y0 = np.clip(y - r, 0, H); y1 = np.clip(y + r + 1, 0, H)
         x0 = np.clip(x - r, 0, W); x1 = np.clip(x + r + 1, 0, W)
@@ -203,70 +187,76 @@ def _guided_filter_numpy(I, r=8, eps=1e-4):
 def guided_filter(f, r=8, eps=1e-4):
     try:
         import cv2
-        I = f.astype(np.float32)
-        k = 2*r + 1
-        mean_I  = cv2.blur(I, (k,k))
-        mean_I2 = cv2.blur(I*I, (k,k))
+        I = f.astype(np.float32); k = 2*r + 1
+        mean_I  = cv2.blur(I, (k,k)); mean_I2 = cv2.blur(I*I, (k,k))
         var_I = mean_I2 - mean_I*mean_I
-        a = var_I / (var_I + eps)
-        b = mean_I - a*mean_I
-        mean_a = cv2.blur(a, (k,k))
-        mean_b = cv2.blur(b, (k,k))
-        q = mean_a*I + mean_b
-        return q.astype(np.float64)
+        a = var_I / (var_I + eps); b = mean_I - a*mean_I
+        mean_a = cv2.blur(a, (k,k)); mean_b = cv2.blur(b, (k,k))
+        return (mean_a*I + mean_b).astype(np.float64)
     except Exception:
         return _guided_filter_numpy(f, r=int(r), eps=float(eps))
 
-# ===================== Quantization =====================
+# ===================== Quantization, cleanup, contours =====================
 def quantize_kmeans(u, levels=4, seed=0):
     H, W = u.shape
     km = KMeans(n_clusters=int(levels), n_init=10, random_state=int(seed))
     raw = km.fit_predict(u.reshape(-1,1)).reshape(H, W)
-
-    # Order clusters by mean intensity ASCENDING: 0 = darkest, last = lightest
     means = []
     for k in np.unique(raw):
         m = u[raw==k].mean() if np.any(raw==k) else np.inf
         means.append((k, m))
     means.sort(key=lambda x: x[1])  # darkest first
-
     mapping = { old:new for new,(old,_) in enumerate(means) }
-    labels = np.vectorize(mapping.get)(raw)
-    return labels
+    return np.vectorize(mapping.get)(raw)
 
 def quantize_multiotsu(u, levels=4):
     thresh = filters.threshold_multiotsu(u, classes=int(levels))
     return np.digitize(u, bins=thresh)
 
-# ===================== Cleanup / contours =====================
-def nested_cleanup_from_labels(labels, levels, min_area=128, open_r=1, close_r=1):
+def _apply_morph(mk, min_area, open_r, close_r):
+    if open_r > 0:  mk = morphology.opening(mk, morphology.disk(int(open_r)))
+    if close_r > 0: mk = morphology.closing(mk, morphology.disk(int(close_r)))
+    if min_area > 0:
+        mk = morphology.remove_small_objects(mk, min_size=int(min_area))
+        mk = morphology.remove_small_holes(mk, area_threshold=int(min_area))
+    return mk
+
+def nested_cleanup_from_labels(labels, levels, min_area=128, open_r=1, close_r=1, mode="dark_first"):
     H, W = labels.shape
-    if levels <= 1: return labels.copy()
-    nested_masks = []; prev = np.ones((H,W), dtype=bool)
-    for k in range(1, int(levels)):
-        mk = labels >= k
-        if open_r > 0:  mk = morphology.opening(mk, morphology.disk(int(open_r)))
-        if close_r > 0: mk = morphology.closing(mk, morphology.disk(int(close_r)))
-        if min_area > 0:
-            mk = morphology.remove_small_objects(mk, min_size=int(min_area))
-            mk = morphology.remove_small_holes(mk, area_threshold=int(min_area))
-        mk = mk & prev; nested_masks.append(mk); prev = mk
-    if nested_masks:
-        labels_nested = np.stack(nested_masks, axis=-1).sum(axis=-1).astype(int)
+    if levels <= 1:
+        return np.zeros((H,W), dtype=int), []
+    masks_cum = []
+    if mode == "dark_first":
+        prev = np.ones((H,W), dtype=bool)
+        for k in range(1, int(levels)):
+            mk = labels >= k
+            mk = _apply_morph(mk, min_area, open_r, close_r)
+            mk = mk & prev
+            masks_cum.append(mk)
+            prev = mk
+    else:  # light_first
+        prev = np.zeros((H,W), dtype=bool)
+        for k in range(1, int(levels)):
+            mk = labels <= k
+            mk = _apply_morph(mk, min_area, open_r, close_r)
+            mk = mk | prev
+            masks_cum.append(mk)
+            prev = mk
+    if masks_cum:
+        labels_nested = np.stack(masks_cum, axis=-1).sum(axis=-1).astype(int)
     else:
         labels_nested = np.zeros((H,W), dtype=int)
-    return labels_nested
+    return labels_nested, masks_cum
 
-def extract_contours_from_nested(labels_nested, levels, simplify='vw', rdp_frac=0.002, vw_area_frac=0.0005):
-    H, W = labels_nested.shape
-    contours_by_level = {k: [] for k in range(int(levels))}
-    if levels <= 1: return contours_by_level
-    if simplify not in ('vw','rdp'): simplify = 'vw'
+def extract_contours_from_masks(masks_cum, simplify='vw', rdp_frac=0.002, vw_area_frac=0.0005):
+    contours_by_level = {}
+    if not masks_cum:
+        return {}
+    H, W = masks_cum[0].shape
     eps = float(rdp_frac) * max(H, W)
     vw_thresh = float(vw_area_frac) * (H * W)
-    for k in range(1, int(levels)):
-        mk = (labels_nested >= k).astype(float)
-        cs = measure.find_contours(mk, 0.5)
+    for idx, mk in enumerate(masks_cum, start=1):  # k = 1..levels-1
+        cs = measure.find_contours(mk.astype(float), 0.5)
         sims = []
         for c in cs:
             if len(c) < 3:
@@ -276,16 +266,10 @@ def extract_contours_from_nested(labels_nested, levels, simplify='vw', rdp_frac=
                 if simplify=='vw' else
                 rdp(c, eps)
             )
-        contours_by_level[k] = sims
+        contours_by_level[idx] = sims
     return contours_by_level
 
-def scale_contours(contours_by_level, sx, sy):
-    out = {}
-    for k, cs in contours_by_level.items():
-        out[k] = [np.column_stack([c[:,0]*sy, c[:,1]*sx]) for c in cs]
-    return out
-
-# ===================== Plotting helpers =====================
+# ===================== Plotting =====================
 def fig_overview(f, u, labels, levels):
     cmap = grayscale_levels_cmap(levels)
     fig, axs = plt.subplots(1,3, figsize=(16,4))
@@ -294,49 +278,62 @@ def fig_overview(f, u, labels, levels):
     axs[2].imshow(labels, vmin=0, vmax=levels-1, cmap=cmap); axs[2].set_title(f'Quantized ({levels}, 0=black → {levels-1}=white)'); axs[2].axis('off')
     return fig
 
-def fig_nested_and_contours(base_img, labels_nested, levels, contours_by_level, simplify):
+def fig_nested_and_contours(base_img, labels_nested, levels, contours_by_level, simplify, mode):
     cmap = grayscale_levels_cmap(levels)
     colors = _level_colors(levels)
+    op = "≤ k" if mode == "light_first" else "≥ k"
     fig, axs = plt.subplots(1,2, figsize=(16,6))
     axs[0].imshow(labels_nested, vmin=0, vmax=levels-1, cmap=cmap)
-    axs[0].set_title('Nested-cleaned labels'); axs[0].axis('off')
+    axs[0].set_title(f'Nested-cleaned labels ({mode})'); axs[0].axis('off')
     axs[1].imshow(base_img, cmap='gray')
     for k in range(1, int(levels)):
         col = colors[k % len(colors)]
         for c in contours_by_level.get(k, []):
             axs[1].plot(c[:,1], c[:,0], color=col)
-    axs[1].set_title(f'Contours (labels ≥ k) [{simplify}]'); axs[1].axis('off')
+    axs[1].set_title(f'Contours from cleaned masks (labels {op})  [{simplify}]'); axs[1].axis('off')
     return fig
 
-def render_per_level(base_img, labels_nested, levels, contours_by_level):
+def render_per_level(base_img, levels, contours_by_level, mode):
     colors = _level_colors(levels)
     figs = []
+    op = "≤" if mode == "light_first" else "≥"
     for k in range(1, int(levels)):
-        mk = (labels_nested >= k)
-        fig, axs = plt.subplots(1,2, figsize=(14,5))
-        axs[0].imshow(mk, cmap='gray'); axs[0].set_title(f'Mask: labels ≥ {k}'); axs[0].axis('off')
-        axs[1].imshow(base_img, cmap='gray')
+        fig, ax = plt.subplots(1,1, figsize=(8,6))
+        ax.imshow(base_img, cmap='gray')
         col = colors[k % len(colors)]
         for c in contours_by_level.get(k, []):
-            axs[1].plot(c[:,1], c[:,0], color=col)
-        axs[1].set_title(f'Contours for labels ≥ {k}'); axs[1].axis('off')
+            ax.plot(c[:,1], c[:,0], color=col)
+        ax.set_title(f'Contours for labels {op} {k}')
+        ax.axis('off')
         figs.append((k, fig))
     return figs
 
-# ===================== Sidebar (controls) =====================
-st.title("Watercolor Value Helper")
-st.write("This is an app to help you find simplified value shapes in your reference shapes.")
-
+# ===================== Sidebar (with help + Run) =====================
+st.title("AT / TV / RGF / Guided  +  VW/RDP  (Run button, progress, dark_first/light_first)")
 
 with st.sidebar:
+    st.header("Quick start")
+    st.markdown(
+        "1. **Upload** an image (or paste a URL)\n"
+        "2. Pick a **smoothing** method (TV/RGF/Guided are faster; AT is highest fidelity)\n"
+        "3. Choose **levels** and **quantization**\n"
+        "4. Pick **contour mode** (dark_first / light_first)\n"
+        "5. (Optional) Adjust **simplification** and **speed tricks**\n"
+        "6. Click **Run / Update**\n"
+        "7. Scroll down to **Downloads**"
+    )
+
+    # Inputs
     st.header("Input")
     upl = st.file_uploader("Upload an image", type=["png","jpg","jpeg","bmp","tif","tiff","webp"])
     url = st.text_input("...or paste image URL (optional)")
-    scale = st.slider("Downscale (before all processing)", 0.05, 1.0, 1.0, 0.05)
+    scale = st.slider("Downscale (before all processing)", 0.05, 1.0, 1.0, 0.05,
+                      help="Uniformly resizes the image before any processing. Smaller = faster.")
 
-    st.header("Smoothing mode")
-    smooth_mode = st.selectbox("Mode", ["AT (slow)", "TV (fast)", "RGF (fast)", "Guided (fast)"], index=1)
-
+    # Smoothing
+    st.header("Smoothing (cartoonization)")
+    smooth_mode = st.selectbox("Mode", ["AT (slow)", "TV (fast)", "RGF (fast)", "Guided (fast)"], index=1,
+                               help="Reduces small details while preserving edges.")
     if smooth_mode == "AT (slow)":
         at_lambda = st.number_input("AT λ", value=0.25, step=0.05, format="%.2f")
         at_alpha  = st.number_input("AT α", value=0.06, step=0.01, format="%.2f")
@@ -355,33 +352,60 @@ with st.sidebar:
         gf_r   = st.number_input("Guided radius r", value=8, step=1)
         gf_eps = st.number_input("Guided eps", value=1e-4, step=1e-4, format="%.6f")
 
+    # Preprocess
     st.header("Preprocess")
-    use_pre = st.checkbox("Enable preprocessing (bilateral + CLAHE)", value=True)
-    sigma_c = st.number_input("Bilateral sigma_color", value=0.05, step=0.01, format="%.3f")
-    sigma_s = st.number_input("Bilateral sigma_spatial", value=3.0, step=1.0, format="%.1f")
-    clahe_clip = st.number_input("CLAHE clip limit", value=0.01, step=0.01, format="%.2f")
+    use_pre   = st.checkbox("Enable preprocessing (bilateral + CLAHE)", value=True)
+    sigma_c   = st.number_input("Bilateral sigma_color", value=0.05, step=0.01, format="%.3f")
+    sigma_s   = st.number_input("Bilateral sigma_spatial", value=3.0, step=1.0, format="%.1f")
+    clahe_clip= st.number_input("CLAHE clip limit", value=0.01, step=0.01, format="%.2f")
 
+    # Quantization
     st.header("Quantization")
-    q_mode = st.selectbox("Quantization method", ["Multi-Otsu", "KMeans"], index=0)
+    q_mode = st.selectbox("Method", ["Multi-Otsu", "KMeans"], index=0)
     levels = st.slider("Levels (0=black ... levels-1=white)", 2, 12, 4, 1)
     seed = st.number_input("KMeans random_state (if KMeans)", value=0, step=1)
 
-    st.header("Nested Cleanup")
+    # Cleanup
+    st.header("Nested cleanup")
     min_area = st.number_input("Min area", value=128, step=32)
     open_r   = st.number_input("Opening radius", value=1, step=1)
     close_r  = st.number_input("Closing radius", value=1, step=1)
 
-    st.header("Simplification")
-    method   = st.selectbox("Method", ["vw","rdp"], index=0)
+    # Contours
+    st.header("Contours")
+    contour_mode = st.selectbox("Contour mode", ["dark_first", "light_first"], index=0,
+                                help="dark_first: labels ≥ k  |  light_first: labels ≤ k")
+    method   = st.selectbox("Simplification", ["vw","rdp"], index=0)
     rdp_frac = st.number_input("RDP epsilon (fraction of max(H,W))", value=0.002, step=0.001, format="%.3f")
     vw_frac  = st.number_input("VW area threshold (fraction of image area)", value=0.0005, step=0.0005, format="%.4f")
     stroke_w = st.number_input("SVG stroke width", value=1.0, step=0.5, format="%.1f")
 
+    # Speed
     st.header("Speed tricks")
     use_internal_lowres = st.checkbox("Process at lower internal scale (contours scaled back up)", value=True)
     internal_scale = st.slider("Internal processing scale", 0.2, 1.0, 0.5, 0.05, disabled=not use_internal_lowres)
 
-# ===================== Load image =====================
+    # Help expanders
+    with st.expander("ℹ️ What’s happening (pipeline overview)"):
+        st.markdown(
+            "**1) Smoothing** → **2) Quantization** → **3) Nested cleanup** → **4) Contours (VW/RDP)**"
+        )
+    with st.expander("🎛 Smoothing tips"):
+        st.markdown("- AT is slow & precise • TV fast default • RGF for noisy • Guided for scans/sketches")
+    with st.expander("🎨 Contour modes"):
+        st.markdown("- **dark_first** uses labels ≥ k (darker outward)\n- **light_first** uses labels ≤ k (lighter inward)")
+    with st.expander("✂️ Simplification"):
+        st.markdown("- Raise VW area or RDP epsilon to reduce points; start modestly and adjust")
+    with st.expander("⚡ Speed"):
+        st.markdown("- Downscale and/or internal scale 0.4–0.6; prefer TV/RGF/Guided over AT when possible")
+
+    # --------- Run button ----------
+    st.markdown("---")
+    run_clicked = st.button("▶️ Run / Update", type="primary")
+    if run_clicked:
+        st.session_state.ready = True
+
+# ===================== Image load + auto-reset on change =====================
 def load_image(upl, url):
     if upl is not None:
         return Image.open(upl).convert("RGB")
@@ -395,12 +419,33 @@ def load_image(upl, url):
             st.error(f"Failed to load from URL: {e}")
     return None
 
+def compute_image_key(upl, url):
+    if upl is not None:
+        try:
+            b = upl.getvalue()
+        except Exception:
+            upl.seek(0)
+            b = upl.read()
+        return "upload:" + hashlib.md5(b).hexdigest()
+    if url:
+        return "url:" + hashlib.md5(url.strip().encode("utf-8")).hexdigest()
+    return None
+
 img = load_image(upl, url)
+img_key = compute_image_key(upl, url)
+
+# Auto-reset the ready flag if the image changed
+if img_key != st.session_state.last_image_key:
+    if st.session_state.last_image_key is not None:
+        st.info("New image detected. Click **Run / Update** to process with current settings.")
+    st.session_state.ready = False
+    st.session_state.last_image_key = img_key
+
 if img is None:
-    st.info("Upload an image or paste a URL to begin.")
+    st.info("Upload an image or paste a URL, then click **Run / Update**.")
     st.stop()
 
-# Downscale first (global)
+# Downscale (global)
 if scale < 1.0:
     new_w = max(1, int(img.width * scale))
     new_h = max(1, int(img.height * scale))
@@ -408,60 +453,87 @@ if scale < 1.0:
 else:
     img_work = img
 
-caption(f"Working size: {img_work.width} × {img_work.height}")
+st.caption(f"Working size: {img_work.width} × {img_work.height}")
 
-# ===================== Run pipeline (cached) =====================
-@cache_data_deco(show_spinner=True)
-def run_pipeline(img_work, smooth_mode, at_params, tv_params, rgf_params, gf_params,
-                 use_pre, sigma_c, sigma_s, clahe_clip,
-                 q_mode, levels, seed,
-                 min_area, open_r, close_r,
-                 method, rdp_frac, vw_frac,
-                 use_internal_lowres, internal_scale):
+# If not ready, just preview
+if not st.session_state.ready:
+    st.info("Adjust settings, then press **Run / Update**.")
+    st.subheader("Preview")
+    show_image(img_work)
+    st.stop()
+
+# ===================== Progress bar =====================
+progress = st.progress(0, text="Starting…")
+
+def update_progress(pct, txt):
+    pct = int(max(0, min(100, pct)))
+    progress.progress(pct, text=txt)
+
+# ===================== Pipeline (with progress updates) =====================
+def run_pipeline_with_progress(img_work, params):
+    update_progress(5, "Preparing…")
     W, H = img_work.width, img_work.height
 
-    # Choose compute image (internal low-res or full working)
-    if use_internal_lowres and internal_scale < 1.0:
-        w2 = max(1, int(W * internal_scale))
-        h2 = max(1, int(H * internal_scale))
+    # Compute image scale
+    if params["use_internal_lowres"] and params["internal_scale"] < 1.0:
+        w2 = max(1, int(W * params["internal_scale"]))
+        h2 = max(1, int(H * params["internal_scale"]))
         img_compute = img_work.resize((w2, h2), RESAMPLE_LANCZOS)
-        sx = W / float(w2)
-        sy = H / float(h2)
+        sx = W / float(w2); sy = H / float(h2)
     else:
         img_compute = img_work
         sx = sy = 1.0
 
-    # Pipeline on compute image
+    # 1) Preprocess
+    update_progress(15, "Converting to grayscale…")
     f = to_gray(np.asarray(img_compute))
-    if use_pre:
-        f_dn = restoration.denoise_bilateral(f, sigma_color=sigma_c, sigma_spatial=sigma_s)
-        f_eq = clahe(f_dn, clip_limit=clahe_clip, nbins=256)
+    if params["use_pre"]:
+        update_progress(25, "Denoising (bilateral)…")
+        f_dn = restoration.denoise_bilateral(f, sigma_color=params["sigma_c"], sigma_spatial=params["sigma_s"])
+        update_progress(35, "Improving local contrast (CLAHE)…")
+        f_eq = clahe(f_dn, clip_limit=params["clahe_clip"], nbins=256)
     else:
         f_eq = f
 
-    # Smooth (u_small) — natural tones
-    if smooth_mode == "AT (slow)":
-        u_small, _ = ambrosio_tortorelli(f_eq, **at_params)
-    elif smooth_mode == "TV (fast)":
-        u_small = pre_smooth_tv(f_eq, **tv_params)
-    elif smooth_mode == "RGF (fast)":
-        u_small = rolling_guidance(f_eq, **rgf_params)
+    # 2) Smoothing
+    sm = params["smooth_mode"]
+    if sm == "AT (slow)":
+        update_progress(50, "Smoothing (Ambrosio–Tortorelli)…")
+        u_small, _ = ambrosio_tortorelli(f_eq, **params["at_params"])
+    elif sm == "TV (fast)":
+        update_progress(50, "Smoothing (Total Variation)…")
+        u_small = pre_smooth_tv(f_eq, **params["tv_params"])
+    elif sm == "RGF (fast)":
+        update_progress(50, "Smoothing (Rolling Guidance)…")
+        u_small = rolling_guidance(f_eq, **params["rgf_params"])
     else:
-        u_small = guided_filter(f_eq, **gf_params)
+        update_progress(50, "Smoothing (Guided filter)…")
+        u_small = guided_filter(f_eq, **params["gf_params"])
 
-    # Quantize labels: 0=darkest, max=lightest
-    if q_mode == "Multi-Otsu":
-        labels_small = quantize_multiotsu(u_small, levels=levels)
+    # 3) Quantization
+    update_progress(65, "Quantizing to discrete levels…")
+    if params["q_mode"] == "Multi-Otsu":
+        labels_small = quantize_multiotsu(u_small, levels=params["levels"])
     else:
-        labels_small = quantize_kmeans(u_small, levels=levels, seed=seed)
+        labels_small = quantize_kmeans(u_small, levels=params["levels"], seed=params["seed"])
 
-    # Nested cleanup & contours
-    labels_nested_small = nested_cleanup_from_labels(labels_small, levels=levels,
-                                                     min_area=min_area, open_r=open_r, close_r=close_r)
-    contours_small = extract_contours_from_nested(labels_nested_small, levels=levels,
-                                                  simplify=method, rdp_frac=rdp_frac, vw_area_frac=vw_frac)
+    # 4) Cleanup
+    update_progress(78, "Cleaning masks (morphology + nesting)…")
+    labels_nested_small, masks_cum_small = nested_cleanup_from_labels(
+        labels_small, levels=params["levels"],
+        min_area=params["min_area"], open_r=params["open_r"], close_r=params["close_r"],
+        mode=params["contour_mode"]
+    )
 
-    # Upsample u/labels to working size for display/download
+    # 5) Contours
+    update_progress(88, "Extracting & simplifying contours…")
+    contours_small = extract_contours_from_masks(
+        masks_cum_small, simplify=params["method"],
+        rdp_frac=params["rdp_frac"], vw_area_frac=params["vw_frac"]
+    )
+
+    # 6) Upsample to working size
+    update_progress(95, "Upsampling results…")
     if sx != 1.0 or sy != 1.0:
         u_img = Image.fromarray((np.clip(u_small, 0, 1)*255).astype(np.uint8)).resize((W, H), RESAMPLE_LANCZOS)
         u_full = np.asarray(u_img).astype(np.float32) / 255.0
@@ -472,39 +544,46 @@ def run_pipeline(img_work, smooth_mode, at_params, tv_params, rgf_params, gf_par
         labn_img = Image.fromarray(labels_nested_small.astype(np.uint8)).resize((W, H), RESAMPLE_NEAREST)
         labels_nested_full = np.asarray(labn_img).astype(int)
 
-        contours_full = scale_contours(contours_small, sx=sx, sy=sy)
+        contours_full = {}
+        for k, cs in contours_small.items():
+            contours_full[k] = [np.column_stack([c[:,0]*sy, c[:,1]*sx]) for c in cs]
     else:
         u_full = u_small
         labels_full = labels_small
         labels_nested_full = labels_nested_small
         contours_full = contours_small
 
-    # Return also the preprocessed grayscale for overview
-    if (sx != 1.0 or sy != 1.0) and use_pre:
+    # 7) Return + final
+    if (sx != 1.0 or sy != 1.0) and params["use_pre"]:
         f_eq_img = Image.fromarray((np.clip(f_eq, 0, 1)*255).astype(np.uint8)).resize((W, H), RESAMPLE_LANCZOS)
         f_eq_full = np.asarray(f_eq_img).astype(np.float32)/255.0
     else:
         f_eq_full = f_eq if (img_compute is img_work) else np.asarray(img_work.convert("L"))/255.0
 
+    update_progress(100, "Done!")
     return f_eq_full, u_full, labels_full, labels_nested_full, contours_full
 
-# pack params for cache key stability
+# Collect params
 at_params = dict(lam=locals().get('at_lambda',0.25), alpha=locals().get('at_alpha',0.06),
                  eps=locals().get('at_eps',1.2), n_iters=int(locals().get('at_iters',200)),
                  tau_u=locals().get('at_tau_u',0.2), tau_v=locals().get('at_tau_v',0.15))
 tv_params = dict(weight=locals().get('tv_weight',0.08), n_iter_max=int(locals().get('tv_iters',50)))
-rgf_params = dict(sigma_s=locals().get('rgf_sigma_s',3.0), sigma_r=locals().get('rgf_sigma_r',0.05),
-                  iters=int(locals().get('rgf_iters',4)))
-gf_params  = dict(r=int(locals().get('gf_r',8)), eps=float(locals().get('gf_eps',1e-4)))
+rgf_params= dict(sigma_s=locals().get('rgf_sigma_s',3.0), sigma_r=locals().get('rgf_sigma_r',0.05),
+                 iters=int(locals().get('rgf_iters',4)))
+gf_params = dict(r=int(locals().get('gf_r',8)), eps=float(locals().get('gf_eps',1e-4)))
 
-f_eq, u, labels, labels_nested, contours = run_pipeline(
-    img_work, smooth_mode, at_params, tv_params, rgf_params, gf_params,
-    bool(use_pre), float(sigma_c), float(sigma_s), float(clahe_clip),
-    q_mode, int(levels), int(seed),
-    int(min_area), int(open_r), int(close_r),
-    method, float(rdp_frac), float(vw_frac),
-    bool(use_internal_lowres), float(internal_scale)
+params = dict(
+    smooth_mode = smooth_mode,
+    at_params = at_params, tv_params = tv_params, rgf_params = rgf_params, gf_params = gf_params,
+    use_pre = bool(use_pre), sigma_c = float(sigma_c), sigma_s = float(sigma_s), clahe_clip = float(clahe_clip),
+    q_mode = q_mode, levels = int(levels), seed = int(seed),
+    min_area = int(min_area), open_r = int(open_r), close_r = int(close_r),
+    contour_mode = contour_mode, method = method, rdp_frac = float(rdp_frac), vw_frac = float(vw_frac),
+    use_internal_lowres = bool(use_internal_lowres), internal_scale = float(internal_scale)
 )
+
+# Run pipeline
+f_eq, u, labels, labels_nested, contours = run_pipeline_with_progress(img_work, params)
 
 # ===================== Display =====================
 c1, c2 = st.columns([1,1], gap="large")
@@ -516,17 +595,14 @@ with c2:
     show_image(u, clamp=True)
 
 st.subheader("Overview")
-fig = fig_overview(f_eq, u, labels, levels)
-show_pyplot(fig)
+show_pyplot(fig_overview(f_eq, u, labels, levels))
 
 st.subheader("Nested + Contours")
-fig2 = fig_nested_and_contours(f_eq, labels_nested, levels, contours, method)
-show_pyplot(fig2)
+show_pyplot(fig_nested_and_contours(f_eq, labels_nested, levels, contours, method, contour_mode))
 
-st.subheader("Per-level Views")
-per_level = render_per_level(f_eq, labels_nested, levels, contours)
-for k, ffig in per_level:
-    show_pyplot(ffig)
+st.subheader("Per-level Contours")
+for k, per_fig in render_per_level(f_eq, levels, contours, contour_mode):
+    show_pyplot(per_fig)
 
 # ===================== Downloads =====================
 st.header("Download Results")
@@ -536,7 +612,7 @@ def array_to_png_bytes(arr, vmin=None, vmax=None, cmap='gray', dpi=150):
     ax = plt.axes([0,0,1,1]); ax.axis('off')
     ax.imshow(arr, vmin=vmin, vmax=vmax, cmap=cmap)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches='tight')
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches='tight', pad_inches=0)
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -580,7 +656,7 @@ contours_json_bytes = json.dumps(contours_to_jsonable(contours)).encode("utf-8")
 st.download_button("Download contours (JSON)", contours_json_bytes, file_name="contours.json", mime="application/json")
 
 H, W = labels_nested.shape
-svg_bytes = contours_to_svg(contours, width=W, height=H, stroke_width=stroke_w)
+svg_bytes = contours_to_svg(contours, width=W, height=H, stroke_width=float(stroke_w))
 st.download_button("Download contours (SVG)", svg_bytes, file_name="contours.svg", mime="image/svg+xml")
 
 # ZIP everything
