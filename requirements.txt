@@ -1,0 +1,8 @@
+streamlit>=1.28
+pillow>=10.0
+scikit-image>=0.22
+scikit-learn>=1.4
+matplotlib>=3.8
+requests>=2.31
+numpy>=1.26
+
